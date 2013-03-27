@@ -1,0 +1,17 @@
+import testing ;
+import os ;
+
+use-project /boost : [ os.environ BOOST_ROOT ] ;
+
+lib ssl ;
+lib crypto ;
+
+run
+    main.cpp
+    :
+    :
+    :
+    <library>/boost/system//boost_system
+    <library>ssl
+    <library>crypto
+    ;
