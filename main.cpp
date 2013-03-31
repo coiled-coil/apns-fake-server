@@ -28,9 +28,21 @@
 
 using namespace std;
 
+int g_invalid_token = -1;
+
 enum { HEADER_SIZE = 1 + 4 + 4 + 2 + 32 + 2, MAX_PAYLOAD_SIZE = 255 };
 
 typedef boost::asio::ssl::stream<boost::asio::ip::tcp::socket> ssl_socket;
+
+struct header_rec
+{
+    unsigned char command;
+    unsigned int identifier;
+    unsigned int expiry;
+    unsigned int token_length;
+    unsigned char *device_token;
+    unsigned int payload_length;
+};
 
 class apns_fake_server;
 class apns_session;
@@ -85,6 +97,7 @@ public:
     ,   context_(context)
     ,   socket_(io_service, context)
     ,   buf_()
+    ,   hdr_()
     {}
 
 private:
@@ -92,6 +105,7 @@ private:
     boost::asio::ssl::context& context_;
     ssl_socket socket_;
     unsigned char buf_[MAX_PAYLOAD_SIZE + 1];
+    header_rec hdr_;
 
     friend class response_handler;
 };
@@ -102,17 +116,6 @@ response_handler::response_handler(apns_fake_server *server)
 ,   session_()
 {
 }
-
-struct header_rec
-{
-    unsigned char command;
-    unsigned int identifier;
-    unsigned int expiry;
-    unsigned int token_length;
-    unsigned char *device_token;
-    unsigned int payload_length;
-};
-
 
 void parse_header(unsigned char *buf, header_rec *r)
 {
@@ -152,6 +155,7 @@ void response_handler::operator()(const boost::system::error_code& ec, std::size
     if (ec)
         return;
 
+
     reenter(this) {
         do {
             session_.reset(new apns_session(server_->io_service_, server_->context_));
@@ -166,21 +170,42 @@ void response_handler::operator()(const boost::system::error_code& ec, std::size
             cout << "-------------------------------" << endl;
             yield boost::asio::async_read(session_->socket_, boost::asio::buffer(session_->buf_, HEADER_SIZE), boost::asio::transfer_at_least(HEADER_SIZE), *this);
 
-            yield {
-                header_rec hdr;
-                parse_header(session_->buf_, &hdr);
-                print_header(hdr);
-                boost::asio::async_read(session_->socket_, boost::asio::buffer(session_->buf_, hdr.payload_length), boost::asio::transfer_at_least(hdr.payload_length), *this);
-                session_->buf_[hdr.payload_length] = 0;
-                cout << reinterpret_cast<char *>(session_->buf_) << endl;
+            parse_header(session_->buf_, &session_->hdr_);
+            print_header(session_->hdr_);
+
+            yield boost::asio::async_read(session_->socket_, boost::asio::buffer(session_->buf_, session_->hdr_.payload_length), boost::asio::transfer_at_least(session_->hdr_.payload_length), *this);
+            session_->buf_[session_->hdr_.payload_length] = 0;
+            cout << reinterpret_cast<char *>(session_->buf_) << endl;
+
+            if (session_->hdr_.identifier == g_invalid_token) {
+                {
+                    boost::system::error_code err;
+                    session_->socket_.lowest_layer().shutdown(boost::asio::ip::tcp::socket::shutdown_receive, err);
+                }
+
+                yield {
+                    unsigned char response_packet[6] = { 8, 8, (g_invalid_token >> 24) & 0xff, (g_invalid_token >> 16) & 0xff, (g_invalid_token >> 8) & 0xff, g_invalid_token & 0xff };
+                    boost::asio::async_write(session_->socket_, boost::asio::buffer(response_packet), *this);
+                }
+                // yield session_->socket_.async_shutdown(*this);
+                break;
             }
         }
     }
 }
 #include "unyield.hpp"
 
-int main()
+int main(int argc, char *argv[])
 {
+    if (argc == 2) {
+        g_invalid_token = atoi(argv[1]);
+    }
+    else if (argc > 2) {
+        cerr << "Invalid option" << endl;
+        return 1;
+    }
+
+
     boost::asio::io_service io_service;
 
     // Wait for signals indicating time to shut down.
