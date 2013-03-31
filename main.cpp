@@ -14,30 +14,39 @@
    limitations under the License.
 */
 
+#include <signal.h>
+#include <stdexcept>
 #include <string>
 #include <boost/asio.hpp>
 #include <boost/asio/ssl.hpp>
 #include <boost/array.hpp>
 #include <boost/function.hpp>
 #include <boost/shared_ptr.hpp>
+#include <boost/bind.hpp>
+#include <boost/shared_ptr.hpp>
 #include "coroutine.hpp"
 
+using namespace std;
+
+enum { HEADER_SIZE = 1 + 4 + 4 + 2 + 32 + 2, MAX_PAYLOAD_SIZE = 255 };
+
+typedef boost::asio::ssl::stream<boost::asio::ip::tcp::socket> ssl_socket;
+
 class apns_fake_server;
+class apns_session;
 
 class response_handler : coroutine
 {
 public:
     explicit response_handler(apns_fake_server *);
-    void operator()(const boost::system::error_code& ec, std::size_t bytes_transferred = -1);
+    void operator()(const boost::system::error_code& ec = boost::system::error_code(), std::size_t bytes_transferred = -1);
 private:
     apns_fake_server *server_;
+    boost::shared_ptr<apns_session> session_;
 };
 
 class apns_fake_server
 {
-public:
-    typedef boost::asio::ssl::stream<boost::asio::ip::tcp::socket> ssl_socket;
-
 public:
     apns_fake_server(boost::asio::io_service& io_service, unsigned short port)
     :   io_service_(io_service)
@@ -68,12 +77,74 @@ private:
     friend class response_handler;
 };
 
+class apns_session
+{
+public:
+    apns_session(boost::asio::io_service& io_service, boost::asio::ssl::context& context)
+    :   io_service_(io_service)
+    ,   context_(context)
+    ,   socket_(io_service, context)
+    ,   buf_()
+    {}
+
+private:
+    boost::asio::io_service& io_service_;
+    boost::asio::ssl::context& context_;
+    ssl_socket socket_;
+    unsigned char buf_[MAX_PAYLOAD_SIZE + 1];
+
+    friend class response_handler;
+};
+
 inline
 response_handler::response_handler(apns_fake_server *server)
 :   server_(server)
+,   session_()
 {
 }
 
+struct header_rec
+{
+    unsigned char command;
+    unsigned int identifier;
+    unsigned int expiry;
+    unsigned int token_length;
+    unsigned char *device_token;
+    unsigned int payload_length;
+};
+
+
+void parse_header(unsigned char *buf, header_rec *r)
+{
+    r->command = *buf++;
+    if (r->command != 1)
+        throw runtime_error("command must be 1");
+
+    r->identifier = (*buf++) << 24 | (*buf++) << 16 | (*buf++) << 8 | (*buf++);
+    r->expiry = (*buf++) << 24 | (*buf++) << 16 | (*buf++) << 8 | (*buf++);
+    r->token_length = (*buf++) << 8 | (*buf++);
+    if (r->token_length != 32)
+        throw runtime_error("token_length must be 32");
+
+    r->device_token = buf;
+    buf += r->token_length;
+    r->payload_length = (*buf++) << 8 | (*buf++);
+    if (r->payload_length >= 256)
+        throw runtime_error("payload length too big");
+
+}
+
+void print_header(header_rec const& r)
+{
+    cout << "command: " << static_cast<unsigned int>(r.command) << "\n"
+         << "identifier: " << r.identifier << "\n"
+         << "payload_length: " << r.payload_length << endl;
+}
+
+//
+// See
+// http://developer.apple.com/library/mac/#documentation/NetworkingInternet/Conceptual/RemoteNotificationsPG/CommunicatingWIthAPS/CommunicatingWIthAPS.html#//apple_ref/doc/uid/TP40008194-CH101-SW4
+//
 #include "yield.hpp"
 inline
 void response_handler::operator()(const boost::system::error_code& ec, std::size_t bytes_transferred)
@@ -81,15 +152,28 @@ void response_handler::operator()(const boost::system::error_code& ec, std::size
     if (ec)
         return;
 
-    char data[100];
-    int size=100;
-
     reenter(this) {
-        yield server_->acceptor_.async_accept(server_->socket_.lowest_layer(), *this);
-        yield server_->socket_.async_handshake(boost::asio::ssl::stream_base::server, *this);
+        do {
+            session_.reset(new apns_session(server_->io_service_, server_->context_));
+            yield server_->acceptor_.async_accept(session_->socket_.lowest_layer(), *this);
+            cout << "new connection" << endl;
+            fork response_handler(*this)();
+        } while(is_parent());
+
+        yield session_->socket_.async_handshake(boost::asio::ssl::stream_base::server, *this);
+        cout << "handshake" << endl;
         while (1) {
-            yield boost::asio::async_read(server_->socket_, boost::asio::buffer(data, size), boost::asio::transfer_at_least(32), *this);
-            yield boost::asio::async_read(server_->socket_, boost::asio::buffer(data, size), boost::asio::transfer_at_least(32), *this);
+            cout << "-------------------------------" << endl;
+            yield boost::asio::async_read(session_->socket_, boost::asio::buffer(session_->buf_, HEADER_SIZE), boost::asio::transfer_at_least(HEADER_SIZE), *this);
+
+            yield {
+                header_rec hdr;
+                parse_header(session_->buf_, &hdr);
+                print_header(hdr);
+                boost::asio::async_read(session_->socket_, boost::asio::buffer(session_->buf_, hdr.payload_length), boost::asio::transfer_at_least(hdr.payload_length), *this);
+                session_->buf_[hdr.payload_length] = 0;
+                cout << reinterpret_cast<char *>(session_->buf_) << endl;
+            }
         }
     }
 }
@@ -98,8 +182,20 @@ void response_handler::operator()(const boost::system::error_code& ec, std::size
 int main()
 {
     boost::asio::io_service io_service;
+
+    // Wait for signals indicating time to shut down.
+    boost::asio::signal_set signals(io_service);
+    signals.add(SIGINT);
+    signals.add(SIGTERM);
+#if defined(SIGQUIT)
+    signals.add(SIGQUIT);
+#endif // defined(SIGQUIT)
+    signals.async_wait(boost::bind(
+          &boost::asio::io_service::stop, &io_service));
+
     apns_fake_server s(io_service, 12195);
     s.start_accept();
+
     io_service.run();
 
     return 0;

@@ -6,10 +6,9 @@ use-project /boost : [ os.environ BOOST_ROOT ] ;
 lib ssl ;
 lib crypto ;
 
-run
+exe apns-fake-server
+    :
     main.cpp
-    :
-    :
     :
     <library>/boost/system//boost_system
     <library>ssl
